@@ -581,9 +581,23 @@ function loadFile(f){
   currentFile = f;
   $('fileName').textContent = f.name;
   video.src = URL.createObjectURL(f);
-  video.onloadedmetadata = () => {
+  video.onloadedmetadata = async () => {
+    // vídeos de WhatsApp/gravações podem reportar duração infinita — força o navegador a calcular
+    if (!isFinite(video.duration) || video.duration <= 0){
+      await new Promise(res => {
+        const h = () => {
+          if (isFinite(video.duration) && video.duration > 0){
+            video.removeEventListener('durationchange', h); res();
+          }
+        };
+        video.addEventListener('durationchange', h);
+        video.currentTime = 1e101;
+        setTimeout(res, 4000); // segurança
+      });
+      video.currentTime = 0.01;
+    }
     state.loaded = true;
-    state.duration = video.duration;
+    state.duration = isFinite(video.duration) ? video.duration : 0;
     state.audioBuffer16k = null;
     state.silences = []; state.cuts = []; state.trimIn = 0; state.trimOut = null; state.cutA = null;
     dropzone.classList.add('hidden');
@@ -868,7 +882,7 @@ function drawFrame(){
   const coverScale = Math.max(W/vw, H/vh) * zoom;
   const cw = vw*coverScale, chh = vh*coverScale;
 
-  if (fit === 'blur' && (W/H).toFixed(2) !== (vw/vh).toFixed(2)){
+  if (fit === 'blur' && Math.abs(W/H - vw/vh) > 0.01){
     ctx.save();
     ctx.filter = 'blur(28px) brightness(.55)';
     ctx.drawImage(video, (W-cw)/2, (H-chh)/2, cw, chh);
@@ -1088,6 +1102,33 @@ $('wordsPerGroup').onchange = () => state.words.length && buildGroups();
 /* ============================================================
    TRANSCRIÇÃO COM IA (Whisper via transformers.js, 100% local)
    ============================================================ */
+/* Carrega o modelo com cascata de tentativas:
+   1) versão "_timestamped" (tem timestamps por palavra) em WebGPU (rápido)
+   2) versão "_timestamped" em WASM
+   3) versão normal (fallback: timestamps por trecho) */
+async function loadASR(baseId, fill, st){
+  const { pipeline } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.1');
+  const progress_callback = p => {
+    if (p.status === 'progress' && p.total){
+      fill.style.width = Math.round(p.progress) + '%';
+      st.textContent = `Baixando modelo: ${(p.loaded/1048576).toFixed(0)} / ${(p.total/1048576).toFixed(0)} MB`;
+    }
+  };
+  const models = [baseId + '_timestamped', baseId];
+  for (const id of models){
+    const configs = [];
+    if (navigator.gpu) configs.push({device:'webgpu', dtype:{encoder_model:'fp32', decoder_model_merged:'q4'}});
+    configs.push({dtype:'q8'});
+    for (const cfg of configs){
+      try {
+        const t = await pipeline('automatic-speech-recognition', id, {...cfg, progress_callback});
+        return t;
+      } catch(e){ console.warn('Falhou:', id, cfg.device||'wasm', e); }
+    }
+  }
+  throw new Error('não consegui baixar o modelo de IA — verifique sua internet');
+}
+
 $('transcribeBtn').onclick = async () => {
   if (!currentFile) return;
   const btn = $('transcribeBtn'), bar = $('trProgress'), fill = bar.firstElementChild, st = $('trStatus');
@@ -1098,48 +1139,57 @@ $('transcribeBtn').onclick = async () => {
     st.textContent = 'Carregando IA (primeira vez baixa o modelo)…';
     const modelId = $('modelSel').value;
     if (!state.transcriber || state.transcriberModel !== modelId){
-      const { pipeline } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.1');
-      state.transcriber = await pipeline('automatic-speech-recognition', modelId, {
-        dtype: 'q8',
-        progress_callback: p => {
-          if (p.status === 'progress' && p.total){
-            fill.style.width = Math.round(p.progress) + '%';
-            st.textContent = `Baixando modelo: ${(p.loaded/1048576).toFixed(0)} / ${(p.total/1048576).toFixed(0)} MB`;
-          }
-        }
-      });
+      state.transcriber = await loadASR(modelId, fill, st);
       state.transcriberModel = modelId;
     }
 
-    st.textContent = 'Transcrevendo… (pode levar alguns minutos)';
-    fill.style.width = '0%';
+    st.textContent = 'Transcrevendo… (pode levar alguns minutos, não feche a aba)';
+    fill.style.width = '100%';
     const lang = $('langSel').value;
-    let done = 0; const totalChunks = Math.max(1, Math.ceil(audio.length/16000/25));
-    const opts = {
-      task:'transcribe', return_timestamps:'word',
-      chunk_length_s:30, stride_length_s:5,
-      chunk_callback: () => { done++; fill.style.width = Math.min(99, Math.round(done/totalChunks*100)) + '%'; },
-    };
+    const opts = {task:'transcribe', return_timestamps:'word', chunk_length_s:30};
     if (lang !== 'auto') opts.language = lang;
 
-    const out = await state.transcriber(audio, opts);
+    let out, wordLevel = true;
+    try {
+      out = await state.transcriber(audio, opts);
+    } catch(e){
+      // modelo sem cross-attentions → usa timestamps por trecho e distribui as palavras
+      console.warn('Sem timestamps por palavra, usando por trecho:', e);
+      wordLevel = false;
+      out = await state.transcriber(audio, {...opts, return_timestamps: true});
+    }
+
+    let words = [];
     const chunks = (out.chunks || []).filter(c => c.text && c.text.trim());
-    state.words = chunks.map(c => ({
-      text: c.text.trim(),
-      start: c.timestamp[0] ?? 0,
-      end: c.timestamp[1] ?? ((c.timestamp[0] ?? 0) + 0.3),
-    })).filter(w => w.text);
+    if (wordLevel){
+      words = chunks.map(c => ({
+        text: c.text.trim(),
+        start: c.timestamp[0] ?? 0,
+        end: c.timestamp[1] ?? ((c.timestamp[0] ?? 0) + 0.3),
+      }));
+    } else {
+      for (const seg of chunks){
+        const ws = seg.text.trim().split(/\s+/).filter(Boolean);
+        if (!ws.length) continue;
+        let s = seg.timestamp?.[0] ?? 0;
+        let e = seg.timestamp?.[1];
+        if (e == null || e <= s) e = s + Math.max(1, ws.length * 0.35);
+        const dur = (e - s) / ws.length;
+        ws.forEach((t,i) => words.push({text:t, start:s + i*dur, end:s + (i+1)*dur}));
+      }
+    }
+    state.words = words.filter(w => w.text);
     for (let i=0;i<state.words.length;i++){
       const w = state.words[i];
       if (!(w.end > w.start)) w.end = w.start + 0.25;
       if (i>0 && w.start < state.words[i-1].start) w.start = state.words[i-1].end;
     }
+    if (!state.words.length) throw new Error('nenhuma fala detectada no áudio');
     buildGroups();
-    fill.style.width = '100%';
     st.textContent = `✅ ${state.words.length} palavras transcritas em ${state.groups.length} blocos!`;
   } catch (err){
     console.error(err);
-    st.textContent = '❌ Erro: ' + (err.message || err) + ' — tente o modelo "Rápido" ou importe um .SRT.';
+    st.textContent = '❌ Erro: ' + (err.message || err) + ' — se persistir, importe um .SRT.';
   } finally {
     btn.disabled = false;
     setTimeout(()=>{ bar.style.display='none'; }, 1500);
@@ -1238,18 +1288,25 @@ $('trimOutBtn').onclick = () => {
 };
 $('cutABtn').onclick = () => {
   state.cutA = video.currentTime;
-  $('trimStatus').textContent = `🚩 Ponto A em ${state.cutA.toFixed(1)}s — navegue até o fim do trecho e clique "Cortar A → aqui"`;
+  renderCutMarks();
+  $('trimStatus').textContent = `🚩 Ponto A marcado em ${state.cutA.toFixed(1)}s — agora clique na timeline no fim do trecho e aperte "Cortar A → aqui"`;
 };
 $('cutBBtn').onclick = () => {
-  const t = video.currentTime;
-  if (state.cutA === null || t <= state.cutA + 0.1){
-    $('trimStatus').textContent = '⚠️ Marque o ponto A primeiro e avance na timeline.';
+  if (state.cutA === null){
+    $('trimStatus').textContent = '⚠️ Primeiro marque o ponto A (início do trecho a remover).';
     return;
   }
-  state.cuts.push({start:state.cutA, end:t});
+  const t = video.currentTime;
+  const s = Math.min(state.cutA, t), e = Math.max(state.cutA, t);
+  if (e - s < 0.15){
+    $('trimStatus').textContent = '⚠️ Mova a bolinha da timeline pra outro ponto — o trecho precisa ter pelo menos 0,2s.';
+    return;
+  }
+  state.cuts.push({start:s, end:e});
   state.cuts.sort((a,b)=>a.start-b.start);
   state.cutA = null;
-  renderTrimStatus(); renderCutMarks(); renderCutChips();
+  renderCutMarks(); renderCutChips();
+  $('trimStatus').textContent = `✂️ Trecho ${s.toFixed(1)}s–${e.toFixed(1)}s removido! Ele será pulado na reprodução e na exportação.`;
 };
 function renderTrimStatus(){
   const endTxt = state.trimOut !== null ? state.trimOut.toFixed(1)+'s' : 'fim';
@@ -1271,7 +1328,15 @@ function renderCutChips(){
 }
 function renderCutMarks(){
   const holder = $('cutMarks'); holder.innerHTML='';
-  if (!state.duration) return;
+  if (!state.duration || !isFinite(state.duration)) return;
+  // marcador temporário do ponto A
+  if (state.cutA !== null){
+    const a = document.createElement('div');
+    a.className = 'cutMark';
+    a.style.left = (state.cutA/state.duration*100)+'%';
+    a.style.width = '3px'; a.style.top = '9px'; a.style.height = '16px';
+    holder.appendChild(a);
+  }
   for (const c of state.cuts){
     const d = document.createElement('div');
     d.className = 'cutMark';
@@ -1310,12 +1375,13 @@ function fmt(t){
   return `${Math.floor(t/60)}:${String(t%60).padStart(2,'0')}`;
 }
 function updateTimeLabel(){
-  $('timeLabel').textContent = `${fmt(video.currentTime)} / ${fmt(state.duration)}`;
-  $('timelineFill').style.width = (state.duration ? (video.currentTime/state.duration*100) : 0) + '%';
+  const d = isFinite(state.duration) ? state.duration : 0;
+  $('timeLabel').textContent = `${fmt(video.currentTime)} / ${fmt(d)}`;
+  $('timelineFill').style.width = (d ? Math.min(100, video.currentTime/d*100) : 0) + '%';
 }
 function renderSilenceMarks(){
   const holder = $('silenceMarks'); holder.innerHTML='';
-  if (!state.duration) return;
+  if (!state.duration || !isFinite(state.duration)) return;
   for (const s of state.silences){
     const d = document.createElement('div');
     d.className = 'silenceMark';
@@ -1326,7 +1392,7 @@ function renderSilenceMarks(){
 }
 function renderGroupMarks(){
   const holder = $('groupMarks'); holder.innerHTML='';
-  if (!state.duration) return;
+  if (!state.duration || !isFinite(state.duration)) return;
   for (const g of state.groups){
     const d = document.createElement('div');
     d.className = 'groupMark';
